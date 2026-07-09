@@ -1,0 +1,115 @@
+name: Build and Deploy Docker Image
+
+"on":
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  APP_URL: https://pia-api.von-poll.com/
+  IMAGE_OWNER: ${{ github.repository_owner }}
+  IMAGE_NAME: ${{ github.repository }}
+  AZURE_CONTAINER_APP_NAME: ca-tool-pia-back
+  AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_CONTAINER_APP_RESOURCE_GROUP }}
+  AZURE_CONTAINER_APP_ENVIRONMENT: ${{ secrets.AZURE_CONTAINER_APP_ENVIRONMENT }}
+  TARGET_PORT: 3000
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    outputs:
+      image-tag: ${{ steps.meta-sha.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CICD_ACTIONS_KEY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker (all tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+            latest
+
+      - name: Extract SHA tag for deployment
+        id: meta-sha
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          ssh: default
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    permissions:
+      id-token: write
+      contents: none
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: 'Production'
+      url: ${{ env.APP_URL }}
+
+    steps:
+      - name: Lowercase the repo name and username
+        run: echo "REPO=${GITHUB_REPOSITORY,,}" >>${GITHUB_ENV}
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_DEPLOYMENT_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_DEPLOYMENT_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_DEPLOYMENT_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure Container App
+        id: deploy-to-containerapp
+        uses: Azure/container-apps-deploy-action@v1
+        with:
+          containerAppName: ${{ env.AZURE_CONTAINER_APP_NAME }}
+          containerAppEnvironment: ${{ env.AZURE_CONTAINER_APP_ENVIRONMENT }}
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: '${{ needs.build-and-push.outputs.image-tag }}'
+          registryUrl: ${{ env.REGISTRY }}
+          registryUsername: ${{ github.actor }}
+          registryPassword: ${{ secrets.AZURE_DEPLOYMENT_PAT }}
+          targetPort: ${{ env.TARGET_PORT }}
+          # ALSO DEFINED IN AZURE CONTAINER APP ENVIRONMENT VARIABLES FOR CONTAINER RUNTIME
+
+      # NOTE: pia-back has no HTTP GET /health endpoint, so no automated health
+      # check runs here (no app-code changes were made). Add a health-check step
+      # against a real endpoint if/when one exists.
